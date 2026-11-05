@@ -1,0 +1,432 @@
+name: Kanda RDP Zero-Touch 24/7
+
+on:
+  workflow_dispatch:
+    inputs:
+      rdp_count:
+        description: "So luong RDP (1-20)"
+        required: false
+        default: "1"
+      user_id:
+        description: "Discord UID"
+        required: false
+        default: "0"
+      data_mode:
+        description: "chung hoac rieng"
+        required: false
+        default: "chung"
+      app_path:
+        description: "Duong dan tool"
+        required: false
+        default: ""
+      keywords:
+        description: "Tu khoa vuot menu"
+        required: false
+        default: "Login,START"
+      threads:
+        description: "So luong"
+        required: false
+        default: "1"
+      license_key:
+        description: "License key"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+  actions: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
+        shell: bash
+        run: |
+          n="${{ inputs.rdp_count }}"
+          if [ -z "$n" ]; then n=1; fi
+          if [ "$n" -lt 1 ] 2>/dev/null; then n=1; fi
+          if [ "$n" -gt 20 ]; then n=20; fi
+          arr=""
+          for i in $(seq 1 "$n"); do
+            if [ -z "$arr" ]; then arr="{\"id\":$i}"; else arr="$arr,{\"id\":$i}"; fi
+          done
+          echo "matrix={\"include\":[$arr]}" >> "$GITHUB_OUTPUT"
+
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    concurrency:
+      group: kanda-${{ github.repository }}-${{ inputs.data_mode }}-${{ matrix.id }}
+      cancel-in-progress: true
+    env:
+      RDP_USER: Thang
+      RDP_PASS: Thang12345@
+      STATE_DIR: C:\KandaState
+      SLOT_ID: ${{ matrix.id }}
+      USER_ID: ${{ inputs.user_id }}
+      DATA_MODE: ${{ inputs.data_mode }}
+      GH_TOKEN: ${{ github.token }}
+      S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+      S3_BUCKET: ${{ secrets.S3_BUCKET }}
+      S3_KEY_ID: ${{ secrets.S3_KEY_ID }}
+      S3_APP_KEY: ${{ secrets.S3_APP_KEY }}
+      BACKUP_PASS: ${{ secrets.BACKUP_PASS }}
+    steps:
+      - name: Enable RDP user
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $u = $env:RDP_USER
+          $sec = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires | Out-Null
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+          }
+          Add-LocalGroupMember -Group 'Administrators' -Member $u -EA SilentlyContinue
+          Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $u -EA SilentlyContinue
+          Set-ItemProperty 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop' -EA SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $env:STATE_DIR | Out-Null
+
+      - name: Perf tweaks
+        run: |
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -EA SilentlyContinue
+            Add-MpPreference -ExclusionPath 'C:\' -EA SilentlyContinue
+          } catch {}
+
+      - name: Install rclone + 7zip
+        run: |
+          $sz = "$env:ProgramFiles\7-Zip\7z.exe"
+          if (-not (Test-Path $sz)) { choco install 7zip -y --no-progress | Out-Null }
+          if (-not (Test-Path $sz)) { $sz = (Get-Command 7z -EA SilentlyContinue).Source }
+          if (-not $sz -or -not (Test-Path $sz)) { Write-Host '::error::7-Zip missing'; exit 1 }
+          "SZ_EXE=$sz" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $dir = "$env:TEMP\rclone"
+          if (-not (Test-Path "$env:TEMP\rclone.exe")) {
+            Invoke-WebRequest 'https://downloads.rclone.org/rclone-current-windows-amd64.zip' -OutFile "$env:TEMP\rclone.zip" -TimeoutSec 180
+            Expand-Archive "$env:TEMP\rclone.zip" -DestinationPath $dir -Force
+            $exe = Get-ChildItem $dir -Recurse -Filter rclone.exe | Select-Object -First 1
+            Copy-Item $exe.FullName "$env:TEMP\rclone.exe" -Force
+          }
+          if (-not (Test-Path "$env:TEMP\rclone.exe")) { Write-Host '::error::rclone missing'; exit 1 }
+          Write-Host '[+] tooling OK'
+          exit 0
+
+      - name: Write rclone.conf
+        run: |
+          $cfg = "$env:TEMP\rclone.conf"
+          $lines = @()
+          if ($env:S3_BUCKET -and $env:S3_ENDPOINT) {
+            $epHost = ($env:S3_ENDPOINT -replace '^https?://', '').TrimEnd('/')
+            $region = 'us-east-1'
+            if ($epHost -match '^s3\.([a-z0-9-]+)\.backblazeb2\.com$') { $region = $matches[1] }
+            $lines += '[vault]'
+            $lines += 'type = s3'
+            $lines += 'provider = Other'
+            $lines += "access_key_id = $($env:S3_KEY_ID)"
+            $lines += "secret_access_key = $($env:S3_APP_KEY)"
+            $lines += "endpoint = https://$epHost"
+            $lines += "region = $region"
+            $lines += 'acl = private'
+            $lines += 'no_check_bucket = true'
+            $lines += ''
+          }
+          if ($lines.Count -eq 0) { Write-Host '[!] Khong co vault secret'; exit 0 }
+          $lines -join "`n" | Set-Content $cfg -Encoding utf8 -NoNewline
+          "RCLONE_CONFIG=$cfg" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Zero-Touch Restore
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $sz = $env:SZ_EXE
+          $rc = "$env:TEMP\rclone.exe"
+          $scope = if ($env:DATA_MODE -eq 'chung') { 'chung' } else { "$($env:USER_ID)-slot-$($env:SLOT_ID)" }
+          $tagName = if ($env:DATA_MODE -eq 'chung') { 'kanda-state-chung' } else { "kanda-state-$($env:USER_ID)-slot-$($env:SLOT_ID)" }
+          $stage = "$env:TEMP\kanda_restore"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $cands = New-Object System.Collections.ArrayList
+
+          function Add-Remote([string]$base, [string]$layer) {
+            if (-not $base) { return }
+            if (-not (Test-Path $rc)) { return }
+            $raw = & $rc lsf $base --files-only 2>$null
+            if ($LASTEXITCODE -ne 0 -or -not $raw) { return }
+            foreach ($n in @($raw)) {
+              $x = $n.Trim()
+              if ($x -match '^\d{8}-\d{6}\.7z$' -or $x -eq 'latest.keep') {
+                [void]$cands.Add([pscustomobject]@{ Layer = $layer; Base = $base; Name = $x })
+              }
+            }
+          }
+
+          if ($env:S3_BUCKET) { Add-Remote "vault:$($env:S3_BUCKET)/kanda/$scope" 'vault' }
+
+          $relNames = & gh release view $tagName -R $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null
+          if ($LASTEXITCODE -eq 0 -and $relNames) {
+            foreach ($n in @($relNames)) {
+              if ($n -match '^\d{8}-\d{6}\.7z$' -or $n -eq 'latest.keep') {
+                [void]$cands.Add([pscustomobject]@{ Layer = 'gh'; Base = $tagName; Name = $n })
+              }
+            }
+          }
+
+          "KANDA_HAD_PRIOR=$(($cands.Count -gt 0).ToString().ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          Write-Host "[i] Tim thay $($cands.Count) ban backup"
+
+          $ordered = @()
+          $ordered += ($cands | Where-Object { $_.Name -ne 'latest.keep' } | Sort-Object -Property Name -Descending)
+          $ordered += ($cands | Where-Object { $_.Name -eq 'latest.keep' })
+
+          $restored = $false
+          foreach ($c in $ordered) {
+            $local = Join-Path $stage 'cand.7z'
+            Remove-Item $local -Force -EA SilentlyContinue
+            if ($c.Layer -eq 'gh') {
+              & gh release download $tagName -R $env:GITHUB_REPOSITORY -p $c.Name -D $stage --clobber 2>$null | Out-Null
+              if (Test-Path (Join-Path $stage $c.Name)) { Move-Item (Join-Path $stage $c.Name) $local -Force }
+            } else {
+              & $rc copyto "$($c.Base)/$($c.Name)" $local 2>$null
+            }
+            if (-not (Test-Path $local)) { continue }
+            if ((Get-Item $local).Length -lt 200KB) { continue }
+            if ($env:BACKUP_PASS) {
+              & $sz t $local "-p$($env:BACKUP_PASS)" -y -bso0 -bsp0 | Out-Null
+            } else {
+              & $sz t $local -y -bso0 -bsp0 | Out-Null
+            }
+            if ($LASTEXITCODE -gt 1) { Write-Host "skip $($c.Layer)/$($c.Name): hong"; continue }
+            if ($env:BACKUP_PASS) {
+              & $sz x $local "-o$($env:SystemDrive)\" -y "-p$($env:BACKUP_PASS)" -bso0 -bsp0 | Out-Null
+            } else {
+              & $sz x $local "-o$($env:SystemDrive)\" -y -bso0 -bsp0 | Out-Null
+            }
+            if ($LASTEXITCODE -le 1) {
+              $restored = $true
+              Write-Host "RESTORED <- $($c.Layer)/$($c.Name)"
+              break
+            }
+          }
+          "KANDA_RESTORED=$($restored.ToString().ToLower())" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          if (-not $restored) { Write-Host '[i] Khong co backup dung duoc - may sach.' }
+          exit 0
+
+      - name: Auto-Launch Tool
+        env:
+          APP_PATH: ${{ inputs.app_path }}
+          KEYWORDS: ${{ inputs.keywords }}
+          THREADS: ${{ inputs.threads }}
+          LICENSE_KEY: ${{ inputs.license_key }}
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:STATE_DIR | Out-Null
+          @{
+            app_path    = $env:APP_PATH
+            keywords    = ($env:KEYWORDS -split ',')
+            threads     = $env:THREADS
+            license_key = $env:LICENSE_KEY
+            slot_id     = $env:SLOT_ID
+          } | ConvertTo-Json -Depth 3 | Set-Content "$env:STATE_DIR\bot_settings.json" -Encoding UTF8
+          if (-not [string]::IsNullOrWhiteSpace($env:APP_PATH) -and (Test-Path $env:APP_PATH)) {
+            Start-Process -FilePath $env:APP_PATH -WorkingDirectory (Split-Path -Parent $env:APP_PATH) -EA SilentlyContinue
+          }
+
+      - name: Continuous Snapshot Daemon
+        run: |
+          $daemon = @'
+          $ErrorActionPreference = 'Continue'
+          $sz = $env:SZ_EXE
+          $rc = "$env:TEMP\rclone.exe"
+          $scope = if ($env:DATA_MODE -eq 'chung') { 'chung' } else { "$($env:USER_ID)-slot-$($env:SLOT_ID)" }
+          $tagName = if ($env:DATA_MODE -eq 'chung') { 'kanda-state-chung' } else { "kanda-state-$($env:USER_ID)-slot-$($env:SLOT_ID)" }
+          $vbase = if ($env:S3_BUCKET) { "vault:$($env:S3_BUCKET)/kanda/$scope" } else { '' }
+          if (-not $vbase) {
+            Write-Host "[i] Khong co vault -> bo qua snapshot, chi giu RDP song."
+            exit 0
+          }
+          $work = 'C:\KandaState\snap'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          if ($env:DATA_MODE -eq 'chung' -and $env:SLOT_ID -ne '1') {
+            Write-Host "[i] Slot $($env:SLOT_ID) o che do chung - khong snapshot."
+            exit 0
+          }
+          $stopAt = (Get-Date).AddMinutes(345)
+          $restored = ($env:KANDA_RESTORED -eq 'true')
+          $hadPrior = ($env:KANDA_HAD_PRIOR -eq 'true')
+          $mayPromote = $restored -or (-not $hadPrior)
+          $u = $env:RDP_USER
+          $drive = "$($env:SystemDrive)\"
+          $lastStatus = [datetime]::MinValue
+          $n = 0
+          function Push-Atomic([string]$base, [string]$file, [string]$nm) {
+            if (-not $base) { return $false }
+            & $rc copyto $file "$base/$nm.tmp" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+              & $rc deletefile "$base/$nm.tmp" 2>$null | Out-Null
+              return $false
+            }
+            & $rc moveto "$base/$nm.tmp" "$base/$nm" 2>$null
+            return ($LASTEXITCODE -eq 0)
+          }
+          while ((Get-Date) -lt $stopAt) {
+            $n++
+            try {
+              $deep = ($n % 6 -eq 0)
+              $name = (Get-Date).ToString('yyyyMMdd-HHmmss') + '.7z'
+              $arc = Join-Path $work $name
+              Remove-Item $arc -Force -EA SilentlyContinue
+              Set-Location $drive
+              $targets = @()
+              foreach ($p in @("Users\$u\Desktop", "Users\$u\Downloads", "Users\$u\Documents")) {
+                if (Test-Path (Join-Path $drive $p)) { $targets += $p }
+              }
+              if ($deep) {
+                foreach ($p in @("Users\$u\AppData\Roaming", "Users\$u\AppData\Local")) {
+                  if (Test-Path (Join-Path $drive $p)) { $targets += $p }
+                }
+              }
+              if ($targets.Count -eq 0) { Start-Sleep -Seconds 60; continue }
+              $a = @('a', $arc, '-t7z', '-mx=1', '-mmt=2', '-bso0', '-bsp0', '-y',
+                     '-xr!Temp', '-xr!tmp', '-xr!Cache', '-xr!*Cache*', '-xr!GPUCache',
+                     '-xr!Code Cache', '-xr!Crashpad', '-xr!node_modules', '-xr!*.log',
+                     '-xr!*.tmp', '-xr!*.lock', '-xr!pagefile.sys', '-xr!swapfile.sys')
+              if ($env:BACKUP_PASS) { $a += "-p$($env:BACKUP_PASS)"; $a += '-mhe=on' }
+              $a += $targets
+              & $sz @a | Out-Null
+              $code = $LASTEXITCODE
+              if (-not (Test-Path $arc)) { Start-Sleep -Seconds 60; continue }
+              if ($code -gt 1) { Write-Host "7z rc=$code"; Start-Sleep -Seconds 60; continue }
+              $size = (Get-Item $arc).Length
+              if ($size -lt 200KB) { Write-Host '[i] snapshot qua nho'; Start-Sleep -Seconds 300; continue }
+              $uploaded = $false
+              if (Push-Atomic $vbase $arc $name) { $uploaded = $true; Write-Host "[+] vault OK $name" }
+              if ($mayPromote -and $uploaded) {
+                & $rc copyto "$vbase/$name" "$vbase/latest.keep.tmp" 2>$null | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                  & $rc moveto "$vbase/latest.keep.tmp" "$vbase/latest.keep" 2>$null | Out-Null
+                } else {
+                  & $rc deletefile "$vbase/latest.keep.tmp" 2>$null | Out-Null
+                }
+              }
+              if ($uploaded -and $size -lt 1.8GB) {
+                & gh release view $tagName -R $env:GITHUB_REPOSITORY 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                  & gh release create $tagName -R $env:GITHUB_REPOSITORY --title "Kanda State" --notes "auto" 2>$null | Out-Null
+                }
+                & gh release upload $tagName $arc -R $env:GITHUB_REPOSITORY 2>$null | Out-Null
+                $names = & gh release view $tagName -R $env:GITHUB_REPOSITORY --json assets --jq '.assets[].name' 2>$null
+                if ($names) {
+                  $snaps = @($names) | Where-Object { $_ -match '^\d{8}-\d{6}\.7z$' } | Sort-Object -Descending
+                  if ($snaps.Count -gt 3) {
+                    foreach ($old in ($snaps | Select-Object -Skip 3)) {
+                      & gh release delete-asset $tagName $old -R $env:GITHUB_REPOSITORY -y 2>$null | Out-Null
+                    }
+                  }
+                }
+              }
+              if ($uploaded -and ((Get-Date) - $lastStatus).TotalMinutes -ge 30) {
+                $st = @{
+                  ok        = $true
+                  scope     = $scope
+                  mode      = $env:DATA_MODE
+                  last_sync = (Get-Date).ToUniversalTime().ToString('o')
+                  sample    = $name
+                  bytes     = $size
+                } | ConvertTo-Json -Compress
+                $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($st))
+                $api = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/contents/vault-status.json"
+                $hdr = @{ Authorization = "Bearer $($env:GH_TOKEN)"; Accept = 'application/vnd.github+json' }
+                $sha = $null
+                try { $sha = (Invoke-RestMethod -Uri $api -Headers $hdr -Method Get -EA Stop).sha } catch {}
+                $body = @{ message = 'vault status'; content = $b64 }
+                if ($sha) { $body.sha = $sha }
+                try {
+                  Invoke-RestMethod -Uri $api -Headers $hdr -Method Put -Body ($body | ConvertTo-Json) -ContentType 'application/json' -EA Stop | Out-Null
+                  $lastStatus = Get-Date
+                  Write-Host '[+] vault-status.json updated'
+                } catch {}
+              }
+              $raw = & $rc lsf $vbase --files-only 2>$null
+              if ($raw) {
+                $all = @($raw) | ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d{8}-\d{6}\.7z$' } | Sort-Object -Descending
+                $protect = @($all | Select-Object -First 5)
+                foreach ($f in $all) {
+                  if ($protect -contains $f) { continue }
+                  $ts = $null
+                  try { $ts = [datetime]::ParseExact(($f -replace '\.7z$',''), 'yyyyMMdd-HHmmss', $null) } catch { continue }
+                  if (((Get-Date) - $ts).TotalDays -gt 7) { & $rc deletefile "$vbase/$f" 2>$null | Out-Null }
+                }
+              }
+              Remove-Item $arc -Force -EA SilentlyContinue
+            } catch {
+              Write-Host "[!] snapshot error: $_"
+            }
+            Start-Sleep -Seconds 300
+          }
+          '@
+          $daemon | Set-Content "$env:STATE_DIR\snapshot_daemon.ps1" -Encoding UTF8
+          Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "$env:STATE_DIR\snapshot_daemon.ps1"
+          )
+
+      - name: Download bore
+        run: |
+          $zip = "$env:TEMP\bore.zip"
+          Invoke-WebRequest 'https://github.com/ekzhang/bore/releases/download/v0.6.0/bore-v0.6.0-x86_64-pc-windows-msvc.zip' -OutFile $zip -TimeoutSec 120
+          Expand-Archive $zip -DestinationPath "$env:TEMP\bore" -Force
+          $exe = Get-ChildItem "$env:TEMP\bore" -Recurse -Filter bore.exe | Select-Object -First 1
+          Copy-Item $exe.FullName "$env:TEMP\bore.exe" -Force
+
+      - name: Bore tunnel + report port
+        run: |
+          $deadline = (Get-Date).AddMinutes(345)
+          $exe = "$env:TEMP\bore.exe"
+          while ((Get-Date) -lt $deadline) {
+            $alive = $false
+            if (Test-Path "$env:TEMP\bore.pid") {
+              $old = Get-Content "$env:TEMP\bore.pid" -EA SilentlyContinue
+              if ($old -and (Get-Process -Id $old -EA SilentlyContinue)) { $alive = $true }
+            }
+            if (-not $alive) {
+              Remove-Item "$env:TEMP\bore.out", "$env:TEMP\bore.err" -Force -EA SilentlyContinue
+              $p = Start-Process -FilePath $exe -ArgumentList 'local', '3389', '--to', 'bore.pub' -PassThru -WindowStyle Hidden -RedirectStandardOutput "$env:TEMP\bore.out" -RedirectStandardError "$env:TEMP\bore.err"
+              $p.Id | Out-File "$env:TEMP\bore.pid" -Encoding ascii
+              $port = $null
+              for ($i = 0; $i -lt 20; $i++) {
+                Start-Sleep -Seconds 1
+                if (Test-Path "$env:TEMP\bore.out") {
+                  $m = Select-String -Path "$env:TEMP\bore.out" -Pattern 'bore\.pub[\s:]+(\d+)' | Select-Object -First 1
+                  if ($m) { $port = $m.Matches[0].Groups[1].Value; break }
+                }
+                if ($p.HasExited) { break }
+              }
+              if ($port) {
+                $b64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("bore.pub:$port"))
+                $hdr = @{ Authorization = "Bearer $($env:GH_TOKEN)"; Accept = 'application/vnd.github+json' }
+                $api = "https://api.github.com/repos/$($env:GITHUB_REPOSITORY)/contents/rdp-ports/$($env:SLOT_ID).txt"
+                for ($t = 1; $t -le 6; $t++) {
+                  $sha = $null
+                  try { $sha = (Invoke-RestMethod -Uri $api -Headers $hdr -EA SilentlyContinue).sha } catch {}
+                  $body = @{ message = "port slot $($env:SLOT_ID)"; content = $b64 }
+                  if ($sha) { $body.sha = $sha }
+                  try {
+                    Invoke-RestMethod -Uri $api -Headers $hdr -Method Put -Body ($body | ConvertTo-Json) -ContentType 'application/json' -EA Stop | Out-Null
+                    break
+                  } catch { Start-Sleep -Seconds 5 }
+                }
+              }
+            }
+            Start-Sleep -Seconds 15
+          }
